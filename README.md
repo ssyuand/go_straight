@@ -1,6 +1,6 @@
-# 🎥 TikTok Live Recorder - Go Straight / Suckless Edition
+# 🎥 Live Recorder - Go Straight / Suckless Edition
 
-這是我為了實現 24/7 全天候監控 TikTok 直播，並將系統資源耗損降到最低，基於 **Unix / Suckless 哲學** 打造的極簡單檔守護進程（Daemon）。
+基於 **Unix / Suckless 哲學** 打造的極簡單檔守護進程（Daemon）。
 
 **核心開發準則：**
 
