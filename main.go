@@ -30,14 +30,16 @@ type Config struct {
 // GlobalState 共享核心狀態
 type GlobalState struct {
 	mu           sync.Mutex
-	IsRecording  bool   `json:"is_recording"`
-	ProbeStatus  string `json:"probe_status"`
-	LatestFile   string `json:"latest_file"`
-	LatestSize   int64  `json:"latest_size"`   // 純數字 (Bytes)
-	LatestMTime  string `json:"latest_mtime"`
-	DiskTotal    uint64 `json:"disk_total"`    // 純數字 (Bytes)
-	DiskAvail    uint64 `json:"disk_avail"`    // 純數字 (Bytes)
-	DiskUsed     uint64 `json:"disk_used"`     // 純數字 (Bytes)
+	IsRecording  bool    `json:"is_recording"`
+	ProbeStatus  string  `json:"probe_status"`
+	LatestFile   string  `json:"latest_file"`
+	LatestSize   int64   `json:"latest_size"`   // 純數字 (Bytes)
+	LatestMTime  string  `json:"latest_mtime"`
+	DiskTotal    uint64  `json:"disk_total"`    // 純數字 (Bytes)
+	DiskAvail    uint64  `json:"disk_avail"`    // 純數字 (Bytes)
+	DiskUsed     uint64  `json:"disk_used"`     // 純數字 (Bytes)
+	CPULoad      string  `json:"cpu_load"`      // 實時 CPU 使用率百分比字串 (例如 "12.5%")
+	RAMPercent   float64 `json:"ram_percent"`  // 實時記憶體使用率百分比 (0.0 ~ 100.0)
 }
 
 var (
@@ -47,6 +49,10 @@ var (
 	prefix       string
 	recordCtx    context.Context
 	recordCancel context.CancelFunc
+
+	// 用於實時 CPU 百分比微積分計算的背景變數
+	lastTotalTime uint64
+	lastIdleTime  uint64
 )
 
 func main() {
@@ -112,7 +118,7 @@ func main() {
 			}
 			// 如果環境變數是 1，代表已經成功在背景了，直接往下走執行主程式
 		default:
-			fmt.Printf("未知參數: %s\n可用指令:\n  ./livetool start   (自動在背景啟動主服務)\n  ./livetool status  (查看目前狀態儀表板)\n  ./livetool stop    (優雅關閉服務與背景小弟)\n", action)
+			fmt.Printf("未知參數: %s\n可用指令:\n  ./livetool start    (自動在背景啟動主服務)\n  ./livetool status   (查看目前狀態儀表板)\n  ./livetool stop     (優雅關閉服務與背景小弟)\n", action)
 			return
 		}
 	} else {
@@ -133,8 +139,9 @@ func main() {
 		log.Printf("[SYSTEM] 成功載入本地 Python 虛擬環境工具箱")
 	}
 
-	// 初始化磁碟資訊與狀態
+	// 初始化磁碟資訊與系統狀態
 	updateDiskStatus()
+	updateSystemResource()
 	state.ProbeStatus = "⚪ 系統初始化完成，雷達待命中..."
 
 	// 啟動智慧哨兵雷達 (背景線程)
@@ -169,14 +176,16 @@ func showCLIStatus() {
 	defer resp.Body.Close()
 
 	var s struct {
-		IsRecording bool   `json:"is_recording"`
-		ProbeStatus string `json:"probe_status"`
-		LatestFile  string `json:"latest_file"`
-		LatestSize  int64  `json:"latest_size"`
-		LatestMTime string `json:"latest_mtime"`
-		DiskTotal   uint64 `json:"disk_total"`
-		DiskAvail   uint64 `json:"disk_avail"`
-		DiskUsed    uint64 `json:"disk_used"`
+		IsRecording bool    `json:"is_recording"`
+		ProbeStatus string  `json:"probe_status"`
+		LatestFile  string  `json:"latest_file"`
+		LatestSize  int64   `json:"latest_size"`
+		LatestMTime string  `json:"latest_mtime"`
+		DiskTotal   uint64  `json:"disk_total"`
+		DiskAvail   uint64  `json:"disk_avail"`
+		DiskUsed    uint64  `json:"disk_used"`
+		CPULoad     string  `json:"cpu_load"`
+		RAMPercent  float64 `json:"ram_percent"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		fmt.Println("[ERROR] 解析伺服器回傳狀態失敗。")
@@ -190,7 +199,7 @@ func showCLIStatus() {
 	}
 
 	fmt.Println("\x1b[36m=========================================================\x1b[0m")
-	fmt.Println("             📊 go_straight 核心監控儀表板")
+	fmt.Println("              📊 go_straight 核心監控儀表板")
 	fmt.Println("\x1b[36m=========================================================\x1b[0m")
 	if s.IsRecording {
 		fmt.Println(" 🎬 錄影狀態: \x1b[31m● 錄影中 (RECORDING)\x1b[0m")
@@ -203,6 +212,7 @@ func showCLIStatus() {
 	fmt.Printf(" 📡 雷達狀態: %s\n", s.ProbeStatus)
 	fmt.Printf(" 💾 磁碟空間: 已用 %.2f GB / 總共 %.2f GB (可用 %.2f GB, 已使用 %.1f%%)\n", 
 		float64(s.DiskUsed)/gb, float64(s.DiskTotal)/gb, float64(s.DiskAvail)/gb, pct)
+	fmt.Printf(" ⚡ 系統效能: CPU 使用率: %s | RAM 使用率: %.1f%%\n", s.CPULoad, s.RAMPercent)
 	fmt.Println("\x1b[36m=========================================================\x1b[0m")
 }
 
@@ -431,7 +441,7 @@ func runRecordEngine(ctx context.Context) {
 }
 
 // ==============================================================================
-// 網頁與 API 伺服器 (調用 Linux df 獲取真實精準磁碟)
+// 網頁與 API 伺服器 (核心極簡原生 Linux 資源讀取)
 // ==============================================================================
 
 func updateDiskStatus() {
@@ -462,8 +472,81 @@ func updateDiskStatus() {
 	state.mu.Unlock()
 }
 
+// Suckless 原生實時解析 Linux 效能資源 (零外部依賴庫)
+func updateSystemResource() {
+	// 1. 讀取精準實時 CPU 百分比 (/proc/stat 微積分差值計算)
+	statData, err := os.ReadFile("/proc/stat")
+	if err == nil {
+		lines := strings.Split(string(statData), "\n")
+		if len(lines) > 0 && strings.HasPrefix(lines[0], "cpu ") {
+			fields := strings.Fields(lines[0])
+			if len(fields) >= 5 {
+				var user, nice, system, idle, iowait, irq, softirq uint64
+				user, _ = strconv.ParseUint(fields[1], 10, 64)
+				nice, _ = strconv.ParseUint(fields[2], 10, 64)
+				system, _ = strconv.ParseUint(fields[3], 10, 64)
+				idle, _ = strconv.ParseUint(fields[4], 10, 64)
+				if len(fields) > 5 { iowait, _ = strconv.ParseUint(fields[5], 10, 64) }
+				if len(fields) > 6 { irq, _ = strconv.ParseUint(fields[6], 10, 64) }
+				if len(fields) > 7 { softirq, _ = strconv.ParseUint(fields[7], 10, 64) }
+
+				currentIdle := idle + iowait
+				currentNonIdle := user + nice + system + irq + softirq
+				currentTotal := currentIdle + currentNonIdle
+
+				state.mu.Lock()
+				// 排除第一次冷啟動，從第二次採樣起計算精確差值百分比
+				if lastTotalTime > 0 && currentTotal > lastTotalTime {
+					totalDiff := currentTotal - lastTotalTime
+					idleDiff := currentIdle - lastIdleTime
+					cpuPercent := (float64(totalDiff - idleDiff) / float64(totalDiff)) * 100
+					state.CPULoad = fmt.Sprintf("%.1f%%", cpuPercent)
+				} else {
+					state.CPULoad = "計算中..."
+				}
+				state.mu.Unlock()
+
+				lastTotalTime = currentTotal
+				lastIdleTime = currentIdle
+			}
+		}
+	} else {
+		state.mu.Lock()
+		state.CPULoad = "N/A"
+		state.mu.Unlock()
+	}
+
+	// 2. 讀取精準實時記憶體 使用率 (/proc/meminfo)
+	memData, err := os.ReadFile("/proc/meminfo")
+	if err == nil {
+		var memTotal, memAvail float64
+		lines := strings.Split(string(memData), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					memTotal, _ = strconv.ParseFloat(fields[1], 64)
+				}
+			}
+			if strings.HasPrefix(line, "MemAvailable:") {
+				fields := strings.Fields(line)
+				if len(fields) > 1 {
+					memAvail, _ = strconv.ParseFloat(fields[1], 64)
+				}
+				break // 關鍵資料拿齊了就直接中斷，不浪費核心時脈
+			}
+		}
+		if memTotal > 0 {
+			state.mu.Lock()
+			state.RAMPercent = ((memTotal - memAvail) / memTotal) * 100
+			state.mu.Unlock()
+		}
+	}
+}
+
 func handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	updateDiskStatus() 
+	updateSystemResource() // 每次 API 被輪詢時同步毫秒級刷新
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -632,6 +715,15 @@ const htmlTemplate = `<!DOCTYPE html>
             <div class="progress-bg">
                 <div id="diskBarFill" class="progress-fill"></div>
             </div>
+
+            <div class="meta-row">
+                <span class="meta-label">⚡ 系統實時負載 <span id="cpuText" style="color:var(--text-main); font-family:monospace; margin-left:5px;">(CPU: 讀取中...)</span></span>
+                <span id="ramText" class="meta-value">RAM: 讀取中...</span>
+            </div>
+            <div class="progress-bg">
+                <div id="ramBarFill" class="progress-fill" style="background-color: var(--accent-green);"></div>
+            </div>
+
             <div class="divider"></div>
             <div class="meta-row" style="margin-bottom:0; padding-top:4px;">
                 <span class="meta-label">📡 背景雷達狀態 <span style="font-size:12px; color:#444;">(排程窗: {{.ProbeStart}} ~ {{.ProbeEnd}})</span></span>
@@ -697,17 +789,32 @@ const htmlTemplate = `<!DOCTYPE html>
 
                     document.getElementById("probeText").innerText = data.probe_status;
 
+                    // 1. 渲染磁碟進度條
                     var totalGB = data.disk_total / (1024*1024*1024);
                     var availGB = data.disk_avail / (1024*1024*1024);
                     var usedGB = data.disk_used / (1024*1024*1024);
                     var pct = totalGB > 0 ? (usedGB / totalGB) * 100 : 0;
 
                     document.getElementById("diskText").innerText = "已用 " + usedGB.toFixed(2) + " GB / 總共 " + totalGB.toFixed(2) + " GB (可用 " + availGB.toFixed(2) + " GB)";
-                    
                     var bar = document.getElementById("diskBarFill");
                     bar.style.width = pct.toFixed(1) + "%";
                     bar.style.backgroundColor = pct > 90 ? "var(--accent-red)" : (pct > 75 ? "var(--accent-orange)" : "var(--accent-blue)");
 
+                    // 2. 渲染實時 CPU 數值 與 RAM 獨立進度條
+                    if (data.cpu_load && data.cpu_load !== "") {
+                        document.getElementById("cpuText").innerText = "(CPU: " + data.cpu_load + ")";
+                    } else {
+                        document.getElementById("cpuText").innerText = "(CPU: 計算中...)";
+                    }
+
+                    if (data.ram_percent !== undefined && data.ram_percent > 0) {
+                        document.getElementById("ramText").innerText = "RAM: " + data.ram_percent.toFixed(1) + "%";
+                        var ramBar = document.getElementById("ramBarFill");
+                        ramBar.style.width = data.ram_percent.toFixed(1) + "%";
+                        ramBar.style.backgroundColor = data.ram_percent > 85 ? "var(--accent-red)" : (data.ram_percent > 65 ? "var(--accent-orange)" : "var(--accent-green)");
+                    }
+
+                    // 3. 渲染實時動態寫入的錄影檔案大小
                     if (data.is_recording && data.latest_file) {
                         var targetRow = document.getElementById("row-" + data.latest_file);
                         if (targetRow) {
