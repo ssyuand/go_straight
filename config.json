@@ -1,0 +1,8 @@
+{
+  "target_url": "https://www.tiktok.com/@pubgthailandofficial/live",
+  "web_port": 36591,
+  "probe_start": "13:30",
+  "probe_end": "00:00",
+  "probe_interval": 10,
+  "probe_sleep_deep": 3600
+}
